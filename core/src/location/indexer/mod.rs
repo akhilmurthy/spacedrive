@@ -8,7 +8,7 @@ use sd_prisma::{
 	prisma_sync,
 };
 use sd_sync::*;
-use sd_utils::{db::inode_to_db, error::FileIOError, from_bytes_to_uuid};
+use sd_utils::{chain_optional_iter, db::inode_to_db, error::FileIOError, from_bytes_to_uuid};
 
 use std::{collections::HashMap, path::Path};
 
@@ -199,8 +199,8 @@ async fn execute_indexer_update_step(
 			let pub_id = sd_utils::uuid_to_bytes(entry.pub_id);
 
 			let should_unlink_object = if let Some(object_id) = entry.maybe_object_id {
-				db.object()
-					.count(vec![prisma_object::id::equals(object_id)])
+				db.file_path()
+					.count(vec![file_path::object_id::equals(Some(object_id))])
 					.exec()
 					.await? > 1
 			} else {
@@ -209,51 +209,46 @@ async fn execute_indexer_update_step(
 
 			use file_path::*;
 
-			let (sync_params, db_params): (Vec<_>, Vec<_>) = [
-				// As this file was updated while Spacedrive was offline, we mark the object_id and cas_id as null
-				// So this file_path will be updated at file identifier job
-				(
-					(object_id::NAME, serde_json::Value::Null),
-					should_unlink_object.then_some(object::disconnect()),
-				),
-				(
-					(cas_id::NAME, serde_json::Value::Null),
-					Some(cas_id::set(None)),
-				),
-				(
-					(is_dir::NAME, json!(*is_dir)),
-					Some(is_dir::set(Some(*is_dir))),
-				),
-				(
+			let (sync_params, db_params): (Vec<_>, Vec<_>) = chain_optional_iter(
+				[
+					((cas_id::NAME, serde_json::Value::Null), cas_id::set(None)),
+					((is_dir::NAME, json!(*is_dir)), is_dir::set(Some(*is_dir))),
 					(
-						size_in_bytes_bytes::NAME,
-						json!(entry.metadata.size_in_bytes.to_be_bytes().to_vec()),
+						(
+							size_in_bytes_bytes::NAME,
+							json!(entry.metadata.size_in_bytes.to_be_bytes().to_vec()),
+						),
+						size_in_bytes_bytes::set(Some(
+							entry.metadata.size_in_bytes.to_be_bytes().to_vec(),
+						)),
 					),
-					Some(size_in_bytes_bytes::set(Some(
-						entry.metadata.size_in_bytes.to_be_bytes().to_vec(),
-					))),
-				),
-				(
-					(inode::NAME, json!(entry.metadata.inode.to_le_bytes())),
-					Some(inode::set(Some(inode_to_db(entry.metadata.inode)))),
-				),
-				(
-					(date_created::NAME, json!(entry.metadata.created_at)),
-					Some(date_created::set(Some(entry.metadata.created_at.into()))),
-				),
-				(
-					(date_modified::NAME, json!(entry.metadata.modified_at)),
-					Some(date_modified::set(Some(entry.metadata.modified_at.into()))),
-				),
-				(
-					(hidden::NAME, json!(entry.metadata.hidden)),
-					Some(hidden::set(Some(entry.metadata.hidden))),
-				),
-			]
+					(
+						(inode::NAME, json!(entry.metadata.inode.to_le_bytes())),
+						inode::set(Some(inode_to_db(entry.metadata.inode))),
+					),
+					(
+						(date_created::NAME, json!(entry.metadata.created_at)),
+						date_created::set(Some(entry.metadata.created_at.into())),
+					),
+					(
+						(date_modified::NAME, json!(entry.metadata.modified_at)),
+						date_modified::set(Some(entry.metadata.modified_at.into())),
+					),
+					(
+						(hidden::NAME, json!(entry.metadata.hidden)),
+						hidden::set(Some(entry.metadata.hidden)),
+					),
+				],
+				[
+					// As this file was updated while Spacedrive was offline, we mark the object_id and cas_id as null
+					// So this file_path will be updated at file identifier job
+					should_unlink_object.then_some((
+						(object_id::NAME, serde_json::Value::Null),
+						object::disconnect(),
+					)),
+				],
+			)
 			.into_iter()
-			.filter_map(|(sync_param, maybe_db_param)| {
-				maybe_db_param.map(|db_param| (sync_param, db_param))
-			})
 			.unzip();
 
 			Ok::<_, IndexerError>((
